@@ -1,0 +1,13 @@
+{
+    "Parameters": {
+        "FunctionName": "finops-scheduletaskecs",
+        "TechTeamContactEmail": "",
+        "PrivateSubnetOne": "",
+        "PrivateSubnetTwo": "",
+        "Environment": "dev",
+        "KmsKeyArn": "",
+        "ContainerSecurityGroup": "",
+        "ScheduleExpressionStart": "cron(0 10 ? * MON-FRI *)",
+        "ScheduleExpressionStop": "cron(55 23 ? * MON-FRI *)"
+    }
+}

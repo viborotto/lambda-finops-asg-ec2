@@ -1,0 +1,550 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: ECS service
+
+Parameters:
+  FunctionName:
+    Description: Name of the function lambda
+    Type: String
+  FeatureName:
+    Description: Nome da feature
+    Type: String
+    AllowedPattern: "[a-z]*"
+  MicroServiceName:
+    Description: Nome do micro servico
+    Type: String
+    AllowedPattern: "[a-z]*"
+    Default: "stopstartecslambda"
+  Environment:
+    Type: String
+  TechTeamContactEmail:
+    Description: Email do lider tecnico da squad
+    Type: String
+  KmsKeyArn:
+    Type: String
+    Description: "ARN da chave gerenciada pelo cliente KMS CMK. Nao utilizar chaves gerenciadas da AWS"
+  ContainerSecurityGroup:
+    Type: String
+    Description: SecurityGroup para execucao do container
+  ScheduleExpressionStop:
+    Description: Stops at 23:55h(8:55PM -3UTC) every days
+    Type: String
+    Default: "cron(55 23 ? * * *)"
+  ScheduleExpressionStart:
+    Description: Starts at 10:00h(7:00AM -3UTC) workdays
+    Type: String
+    Default: "cron(0 10 ? * MON-FRI *)"
+  TagKeyForDisableLambda:
+    Description: Tag Key from service for disable the execution lambda
+    Type: String
+    Default: "DoNotStop"
+  TagValueForDisableLambda:
+    Description: Tag Value from service for disable the execution lambda
+    Type: String
+    Default: "True"
+  PrivateSubnetOne:
+    Type: String
+  PrivateSubnetTwo:
+    Type: String
+  ServiceNowSNSTopicName:
+    Type: String
+    Default: "Alarm-SNS-Topic"
+    AllowedPattern: "^[a-zA-Z0-9-_]+${1,256}"
+    Description: "Name for the SNS Topic for Alarm Notifications"
+
+  ProvisionedConcurrentExecutions:
+    Type: String
+    Default: 1000
+    AllowedPattern: "^[0-9]{1,}$"
+    Description: "Threshold for used provisioned concurrent alarm. The max value of function concurrency is 1000"
+
+Conditions:
+  ISProduction: !Equals [!Ref Environment, "prod"]
+  ISNotProduction: !Not [Condition: ISProduction]
+
+Resources:
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${FeatureName}-${MicroServiceName}"
+      RetentionInDays: 1
+
+  StopStartEcsLambda:
+    Type: AWS::Lambda::Function
+    Condition: ISNotProduction
+    Properties:
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension:14"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          cloudwatchvalue = ''
+
+          ### Sets the desired count of tasks per service to 1 or 0
+          ### Container will spawn or stops after a few moments
+          ### By default exec lambda is True, although it is possible to configure a Tag to disable its execution
+          def updatecontainer(client, servicearns, clusterArn, newDesiredCount):
+              for srv in servicearns:
+
+                  execLambda = True
+
+                  response = client.list_tags_for_resource(
+                      resourceArn=srv
+                  )
+                  listTags = response['tags']
+                  for servTag in listTags:
+                      if servTag['key'] == '${TagKeyForDisableLambda}':  # Valida se existe a key para não rodar a integração.
+                          execLambda = False
+                          print("Scheduler " + cloudwatchvalue + " disable for " + srv)
+
+                  if execLambda is True:
+                      print("Scheduler " + cloudwatchvalue + " enabled for " + srv)
+                      client.update_service(
+                          cluster=clusterArn,
+                          service=srv,
+                          desiredCount=newDesiredCount,
+                      )
+
+
+          def update_asg_desired_count(asg, new_desired_count, minimum):
+              # para cada instancia atualizar o valor de desired
+              asg_client.update_auto_scaling_group(
+                  AutoScalingGroupName=asg,
+                  DesiredCapacity=int(new_desired_count),
+                  MinSize=int(minimum),
+              )
+
+          def lambda_handler(event, context):
+              ### The cloudwatch alarm sends a paramater called 'action' which is set to 'start' or 'stop'
+              ### Lambda decides depending on the value whether to start or stop the container
+              global cloudwatchvalue
+              cloudwatchvalue = event.get('action')
+
+              client = boto3.client('ecs')
+              asg_client = boto3.client('autoscaling')
+
+              clusterList = client.list_clusters(maxResults=50)['clusterArns']
+
+              # List ASG Names, Desired Count and MinSize by tag
+              filter_asg_list_names = asg_client.get_paginator('describe_auto_scaling_groups').paginate(
+              PaginationConfig={'PageSize': 100}).search('AutoScalingGroups[].[AutoScalingGroupName]')
+              list_start_desired = list(asg_client.get_paginator('describe_auto_scaling_groups').paginate(PaginationConfig={'PageSize': 100})
+              .search('AutoScalingGroups[].[Tags[?Key ==`{}`].Value[]]'.format('Desired')))
+              list_start_min = list(asg_client.get_paginator('describe_auto_scaling_groups').paginate(PaginationConfig={'PageSize': 100})
+              .search('AutoScalingGroups[].[Tags[?Key ==`{}`].Value[]]'.format('Minimum')))
+
+              # Get Clusters
+              for clusterArn in clusterList:
+
+                  ### Query to the ECS API to get all running services
+                  ### Output limit is currently set to 50
+                  try:
+                      response = client.list_services(
+                          cluster=clusterArn,
+                          maxResults=50,
+                          launchType='FARGATE',
+                          schedulingStrategy='REPLICA'
+                      )
+                  except:
+                      print("didnt worked")
+
+                  ### Retrieves only the plain service arns from the output
+                  ### Values are stored in a list
+                  servicelist = response['serviceArns']
+
+                  if len(servicelist) > 0:
+                      if 'start' == cloudwatchvalue:
+                          print("starting services")
+                          updatecontainer(client, servicelist, clusterArn, 1)
+
+                      elif 'stop' == cloudwatchvalue:
+                          print("stopping services")
+                          updatecontainer(client, servicelist, clusterArn, 0)
+              for asg_item, desired, minimum in zip(filter_asg_list_names, list_start_desired, list_start_min):
+                  if 'start' == cloudwatchvalue:
+                      print("####### starting scale out instances #######")
+                      print("ASG: {asg_name}; Desired: {desired_count}; Minimum: {minimum_size}".format(asg_name=asg_item[0], desired_count=desired[0][0], minimum_size=minimum[0][0]))
+                      update_asg_desired_count(asg_item[0], desired[0][0], minimum[0][0])
+
+                  elif 'stop' == cloudwatchvalue:
+                      print("####### stopping instances - scale in ########")
+                      print("ASG: {asg_name} set desired: 0".format(asg_name=asg_item[0]))
+                      update_asg_desired_count(asg_item[0], 0, 0)
+
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Script finished')
+              }
+      KmsKeyArn: !Ref KmsKeyArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ContainerSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetOne
+          - !Ref PrivateSubnetTwo
+      Description: Sets all ECS services desired count to 0 or 1
+      FunctionName: !Ref FunctionName
+      Handler: "index.lambda_handler"
+      Role: !GetAtt StopStartEcsLambdaIamRole.Arn
+      Runtime: "python3.8"
+      Timeout: 30
+      Tags:
+        - Key: tech-team-email
+          Value: !Ref TechTeamContactEmail
+  version:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: v1
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 20
+
+  StopStartEcsLambdaIamRole:
+    Type: "AWS::IAM::Role"
+    Condition: ISNotProduction
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: ["sts:AssumeRole"]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        - "arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/CloudWatchFullAccess"
+      Policies:
+        - PolicyName: scaling-lambda-autoscaling
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:DescribeScalingActivities
+                  - application-autoscaling:DescribeScalingPolicies
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:RegisterScalableTarget
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:CreateAutoScalingGroup
+                  - autoscaling:CreateLaunchConfiguration
+                  - autoscaling:DeleteAutoScalingGroup
+                  - autoscaling:DeleteLaunchConfiguration
+                  - autoscaling:Describe*
+                Resource: "*"
+        - PolicyName: scaling-lambda-s3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:GetObjectVersion
+                  - s3:ListObjects
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                Resource: "*"
+        - PolicyName: scaling-lambda-ecs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:Describe*
+                  - ecs:List*
+                  - ecs:Update*
+                  - ecs:Deregister*
+                  - ecs:StopTask
+                  - ecs:StartTask
+                Resource: "*"
+        - PolicyName: scaling-lambda-lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                Resource: "*"
+        - PolicyName: scaling-lambda-kms
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: "*"
+
+  StartEcsServicesRuleCloudwatch:
+    Type: AWS::Events::Rule
+    Condition: ISNotProduction
+    Properties:
+      Description: Starts at 10am(7am-3UTC) on workdays
+      Name: StartEcsServicesRule
+      ScheduleExpression: !Ref ScheduleExpressionStart
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopStartEcsLambda.Arn
+          Input: !Sub '{"action": "start"}'
+          Id: startLambda
+
+  StopEcsServicesRuleCloudwatch:
+    Type: AWS::Events::Rule
+    Condition: ISNotProduction
+    Properties:
+      Description: Stops at 23:55pm(20:55pm-3UTC) every days
+      Name: StopEcsServicesRule
+      ScheduleExpression: !Ref ScheduleExpressionStop
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopStartEcsLambda.Arn
+          Input: !Sub '{"action": "stop"}'
+          Id: stopLambda
+
+  StartEcsServicesRuleCloudwatchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt StopStartEcsLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StartEcsServicesRuleCloudwatch.Arn
+
+  StopEcsServicesRuleCloudwatchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt StopStartEcsLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StopEcsServicesRuleCloudwatch.Arn
+
+  404MetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "${FeatureName}-${MicroServiceName}"
+      FilterPattern: "[ip, identity, user_id, timestamp, request, status_code = 404, size, ...]"
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: !Sub "${FeatureName}-${MicroServiceName}/404s"
+          MetricName: !Sub "${FeatureName}-${MicroServiceName}/404Count"
+    DependsOn: CloudWatchLogGroup
+
+  404Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-404s"
+      AlarmDescription: "Alarm description"
+      MetricName: !Sub "${FeatureName}-${MicroServiceName}/404Count"
+      Namespace: !Sub "${FeatureName}-${MicroServiceName}/404s"
+      Statistic: Sum
+      Period: "60"
+      EvaluationPeriods: "1"
+      Threshold: "1"
+      AlarmActions:
+        - "{{resolve:ssm:/org/member/workload_local_sns_arn:1}}"
+      OKActions:
+        - "{{resolve:ssm:/org/member/workload_local_sns_arn:1}}"
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+    DependsOn: 404MetricFilter
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-ErrorAlarm"
+      AlarmDescription: !Sub "Alarm triggered if error exceeds 1 errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Sum
+      Period: "300"
+      EvaluationPeriods: "1"
+      Threshold: "1"
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  ConcurrentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-ConcurrentAlarm"
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Period: "300"
+      EvaluationPeriods: "1"
+      DatapointsToAlarm: 1
+      Threshold: "800"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  UnreservedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-UnreservedAlarm"
+      Namespace: AWS/Lambda
+      MetricName: UnreservedConcurrentExecutions
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Period: "300"
+      EvaluationPeriods: "1"
+      Threshold: "800"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-DurationAlarm"
+      AlarmDescription: !Sub "Alarm triggered if duration exceeds 7000ms"
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Period: "60"
+      EvaluationPeriods: "1"
+      Threshold: "7000"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-ThrottleAlarm"
+      AlarmDescription: "Alarm if a throttle event occurs"
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: "0"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  InvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-InvocationAlarm"
+      AlarmDescription: "Alarm if a function is no longer being used"
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 12
+      DatapointsToAlarm: 12
+      Threshold: "1"
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  DeadLetterErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-DeadLetterErrorsAlarm"
+      AlarmDescription: "Alarm if a Dead-letter errors occur"
+      MetricName: DeadLetterErrors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: "1"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  DestinationDeliveryFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-DestinationDeliveryFailuresAlarm"
+      AlarmDescription: "Alarm if a Delivery erros occur"
+      MetricName: DestinationDeliveryFailures
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: "1"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  MemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-MemoryUtilizationAlarm"
+      AlarmDescription: !Sub "Alarm triggered if memory utilization exceeds 80%"
+      Namespace: LambdaInsights
+      MetricName: memory_utilization
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Unit: Percent
+      Period: "180"
+      EvaluationPeriods: "1"
+      Threshold: "80"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+  ProvisionedConcurrencyUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-ProvisionedConcurrencyUtilizationAlarm"
+      AlarmDescription: !Sub "Alarm triggered if capacity of provisioned concurrency exceeds 80%"
+      Namespace: AWS/Lambda
+      MetricName: ProvisionedConcurrencyUtilization
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Unit: Percent
+      Period: "180"
+      EvaluationPeriods: "1"
+      Threshold: "80"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+
+  ProvisionedConcurrencySpilloverInvocations:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Alarm-${FeatureName}-${MicroServiceName}-ProvisionedConcurrencySpilloverInvocations"
+      AlarmDescription: !Sub "Alarm triggered if lambda have invocation that runs on non-provisioned concurrency."
+      Namespace: AWS/Lambda
+      MetricName: ProvisionedConcurrencySpilloverInvocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${FunctionName}"
+      Statistic: Maximum
+      Period: "180"
+      EvaluationPeriods: "1"
+      Threshold: "1"
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:AWS-Landing-Zone-Workload-Notification"
+
+
