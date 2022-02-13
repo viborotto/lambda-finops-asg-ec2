@@ -15,6 +15,11 @@ Another way to do that is creating an Scheduled Action attached to Auto Scaling 
 https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/application-autoscaling.html#ApplicationAutoScaling.Client.put_scheduled_action
 
 
+#### Lambda Optimization:
+
+After optimize costs from EC2 and ASG, we will try to reduce costs from Lambda that we builded. 
+https://aws.amazon.com/blogs/compute/operating-lambda-performance-optimization-part-1/
+
 #### References:
 https://aws.plainenglish.io/aws-lambda-best-practices-7454da49314d
 https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html
