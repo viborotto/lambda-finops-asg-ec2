@@ -13,3 +13,9 @@ i.e. start instances Monday to Friday during business hours
     
 Another way to do that is creating an Scheduled Action attached to Auto Scaling Group
 https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/application-autoscaling.html#ApplicationAutoScaling.Client.put_scheduled_action
+
+
+#### References:
+https://aws.plainenglish.io/aws-lambda-best-practices-7454da49314d
+https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html
+https://medium.com/platform-engineer/aws-lambda-functions-best-practices-f40b60596a0c
